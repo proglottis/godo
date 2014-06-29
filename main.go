@@ -1,77 +1,104 @@
 package main
 
 import (
-	"github.com/go-martini/martini"
-	"github.com/martini-contrib/binding"
-	"github.com/martini-contrib/render"
-	"gopkg.in/redis.v1"
+	"encoding/json"
+	"io"
+	"log"
 	"net/http"
-	"strconv"
+	"os"
+	"strings"
+
+	"gopkg.in/redis.v1"
 )
 
-type Item struct {
-	Id   string `json:"id"`
-	Text string `json:"text" binding:"required"`
+type ItemsHandler struct {
+	Store *ItemStore
+}
+
+func (h ItemsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case "GET":
+		h.Index(w)
+	case "POST":
+		h.Create(w, r)
+	default:
+		http.Error(w, "", http.StatusMethodNotAllowed)
+	}
+}
+
+func (h ItemsHandler) Index(w http.ResponseWriter) {
+	items, err := h.Store.All()
+	if err != nil {
+		panic(err)
+	}
+	JSON(w, items)
+}
+
+func (h ItemsHandler) Create(w http.ResponseWriter, r *http.Request) {
+	var item Item
+	dec := json.NewDecoder(r.Body)
+	for {
+		if err := dec.Decode(&item); err == io.EOF {
+			break
+		} else if err != nil {
+			panic(err)
+		}
+	}
+	err := h.Store.Persist(&item)
+	if err != nil {
+		panic(err)
+	}
+	JSON(w, item)
+}
+
+type ItemHandler struct {
+	Store *ItemStore
+}
+
+func (h ItemHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	path := strings.Split(r.URL.Path, "/")
+	id := path[len(path)-1]
+	switch r.Method {
+	case "DELETE":
+		h.Delete(w, id)
+	default:
+		http.Error(w, "", http.StatusMethodNotAllowed)
+	}
+}
+
+func (h ItemHandler) Delete(w http.ResponseWriter, id string) {
+	err := h.Store.Delete(id)
+	if err != nil {
+		panic(err)
+	}
+	JSON(w, nil)
 }
 
 func main() {
-	m := martini.Classic()
-	m.Use(render.Renderer(render.Options{
-		IndentJSON: true,
-		Layout:     "layout",
-	}))
 	client := redis.NewTCPClient(&redis.Options{
 		Addr: "localhost:6379",
 	})
 	defer client.Close()
-	m.Map(client)
+	store := &ItemStore{Client: client}
 
-	m.Get("/", Root)
+	http.Handle("/", http.StripPrefix("/", http.FileServer(http.Dir("public"))))
+	http.Handle("/items", ItemsHandler{Store: store})
+	http.Handle("/items/", ItemHandler{Store: store})
 
-	// Items
-	m.Get("/items", GetItems)
-	m.Post("/items", binding.Bind(Item{}), CreateItem)
-	m.Delete("/items/:id", DeleteItem)
-
-	m.Run()
+	port := os.Getenv("PORT")
+	if len(port) < 1 {
+		port = "3000"
+	}
+	if err := http.ListenAndServe(":" + port, nil); err != nil {
+		log.Fatal(err)
+	}
 }
 
-func Root(r render.Render) {
-	r.HTML(http.StatusOK, "index", nil)
-}
-
-func GetItems(r render.Render, c *redis.Client) {
-	results, err := c.HGetAllMap("godo:items").Result()
+func JSON(w http.ResponseWriter, v interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	bytes, err := json.Marshal(v)
 	if err != nil {
 		panic(err)
 	}
-	items := make([]Item, 0, len(results))
-	for id, text := range results {
-		items = append(items, Item{
-			Id:   id,
-			Text: text,
-		})
-	}
-	r.JSON(http.StatusOK, items)
-}
-
-func CreateItem(r render.Render, c *redis.Client, item Item) {
-	id, err := c.Incr("godo:itemId").Result()
-	if err != nil {
-		panic(err)
-	}
-	item.Id = strconv.FormatInt(id, 10)
-	err = c.HSet("godo:items", item.Id, item.Text).Err()
-	if err != nil {
-		panic(err)
-	}
-	r.JSON(http.StatusOK, item)
-}
-
-func DeleteItem(r render.Render, params martini.Params, c *redis.Client) {
-	err := c.HDel("godo:items", params["id"]).Err()
-	if err != nil {
-		panic(err)
-	}
-	r.JSON(http.StatusOK, nil)
+	w.Write(bytes)
 }
